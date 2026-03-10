@@ -1,0 +1,371 @@
+# =============================================================================
+# Oil Weekly Bias Dashboard — Data Fetcher
+# =============================================================================
+import io
+import os
+import zipfile
+from datetime import datetime, timedelta
+
+import pandas as pd
+import requests
+import yfinance as yf
+from dotenv import load_dotenv
+
+import config
+
+load_dotenv()
+
+
+def _get_fred_key() -> str:
+    """Read FRED API key from .env (local) or Streamlit secrets (cloud)."""
+    key = os.getenv("FRED_API_KEY", "")
+    if not key:
+        try:
+            import streamlit as st
+            key = st.secrets["FRED_API_KEY"]
+        except (KeyError, FileNotFoundError, Exception):
+            pass
+    return key
+
+
+def _get_eia_key() -> str:
+    """Read EIA API key from .env (local) or Streamlit secrets (cloud)."""
+    key = os.getenv("EIA_API_KEY", "")
+    if not key:
+        try:
+            import streamlit as st
+            key = st.secrets["EIA_API_KEY"]
+        except (KeyError, FileNotFoundError, Exception):
+            pass
+    return key
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _years_ago(n: int) -> str:
+    return (datetime.today() - timedelta(days=365 * n)).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# Yahoo Finance
+# ---------------------------------------------------------------------------
+
+def fetch_weekly_prices(years: int = config.PRICE_HISTORY_YEARS) -> dict[str, pd.DataFrame]:
+    """Download weekly OHLCV for every ticker in config.TICKERS. Returns dict {key: DataFrame}."""
+    start = _years_ago(years)
+    result = {}
+    tickers_list = list(config.TICKERS.values())
+    keys_list    = list(config.TICKERS.keys())
+
+    raw = yf.download(
+        tickers_list,
+        start=start,
+        interval="1wk",
+        auto_adjust=True,
+        progress=False,
+        group_by="ticker",
+    )
+
+    for key, ticker in zip(keys_list, tickers_list):
+        try:
+            if len(tickers_list) == 1:
+                df = raw[["Close"]].dropna()
+            else:
+                df = raw[ticker][["Close"]].dropna()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            result[key] = df
+        except Exception:
+            result[key] = pd.DataFrame(columns=["Close"])
+
+    return result
+
+
+def fetch_etf_shares_outstanding() -> dict[str, float | None]:
+    """Return current shares outstanding for each energy ETF (flow proxy)."""
+    etf_keys = ["xle", "xop", "uso"]
+    result = {}
+    for key in etf_keys:
+        ticker = config.TICKERS[key]
+        try:
+            info = yf.Ticker(ticker).info
+            shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+            result[key] = shares
+        except Exception:
+            result[key] = None
+    return result
+
+
+# ---------------------------------------------------------------------------
+# FRED API
+# ---------------------------------------------------------------------------
+
+def fetch_fred_series(years: int = config.PRICE_HISTORY_YEARS, api_key: str = "") -> dict[str, pd.Series]:
+    """Download FRED series via direct REST API. Falls back gracefully if FRED_API_KEY is missing."""
+    api_key = api_key or _get_fred_key()
+    result = {}
+
+    if not api_key:
+        for k in config.FRED_SERIES:
+            result[k] = pd.Series(dtype=float, name=k)
+        return result
+
+    start    = _years_ago(years)
+    base_url = "https://api.stlouisfed.org/fred/series/observations"
+
+    for key, series_id in config.FRED_SERIES.items():
+        try:
+            resp = requests.get(base_url, params={
+                "series_id":         series_id,
+                "api_key":           api_key,
+                "file_type":         "json",
+                "observation_start": start,
+            }, timeout=15)
+            resp.raise_for_status()
+            obs    = resp.json().get("observations", [])
+            dates  = [o["date"] for o in obs]
+            values = [float(o["value"]) if o["value"] != "." else float("nan") for o in obs]
+            s = pd.Series(values, index=pd.to_datetime(dates), name=key).dropna()
+            result[key] = s
+        except Exception:
+            result[key] = pd.Series(dtype=float, name=key)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# EIA Open Data API
+# ---------------------------------------------------------------------------
+
+def _fetch_eia_weekly_series(series_id: str, api_key: str, weeks: int) -> pd.Series:
+    """Fetch a single EIA v2 weekly petroleum stocks series. Returns pd.Series."""
+    try:
+        resp = requests.get(config.EIA_STOCKS_URL, params={
+            "api_key":            api_key,
+            "frequency":          "weekly",
+            "data[0]":            "value",
+            "facets[series][]":   series_id,
+            "sort[0][column]":    "period",
+            "sort[0][direction]": "desc",
+            "length":             weeks,
+        }, timeout=20)
+        resp.raise_for_status()
+        data = resp.json().get("response", {}).get("data", [])
+        if not data:
+            return pd.Series(dtype=float)
+        dates  = [r["period"] for r in data]
+        values = [float(r["value"]) if r.get("value") not in (None, "") else float("nan") for r in data]
+        return pd.Series(values, index=pd.to_datetime(dates)).sort_index().dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def fetch_eia_inventory(api_key: str = "") -> dict[str, pd.Series]:
+    """
+    Fetch WEEKLY EIA petroleum stocks data (crude, gasoline, distillates).
+    Note: these are stocks/inventory levels — weekly draws/builds.
+    Crude oil imports are monthly only (fetched separately in fetch_eia_imports).
+    Returns empty Series per key if EIA_API_KEY missing.
+    """
+    api_key = api_key or _get_eia_key()
+    if not api_key:
+        return {k: pd.Series(dtype=float) for k in ["crude", "gasoline", "distillate"]}
+
+    weeks = config.EIA_HISTORY_WEEKS
+    return {
+        "crude":      _fetch_eia_weekly_series(config.EIA_CRUDE_SERIES,      api_key, weeks),
+        "gasoline":   _fetch_eia_weekly_series(config.EIA_GASOLINE_SERIES,   api_key, weeks),
+        "distillate": _fetch_eia_weekly_series(config.EIA_DISTILLATE_SERIES, api_key, weeks),
+    }
+
+
+def fetch_eia_imports(api_key: str = "") -> pd.Series:
+    """
+    Fetch MONTHLY US crude oil import volumes from EIA.
+    Note: crude oil imports are only available at monthly frequency (EIA limitation).
+    Returns pd.Series of monthly import quantities (Mbbl/d), empty Series if key missing.
+    """
+    api_key = api_key or _get_eia_key()
+    if not api_key:
+        return pd.Series(dtype=float)
+
+    try:
+        resp = requests.get(config.EIA_IMPORTS_URL, params={
+            "api_key":            api_key,
+            "frequency":          "monthly",
+            "data[0]":            "quantity",
+            "sort[0][column]":    "period",
+            "sort[0][direction]": "desc",
+            "length":             config.EIA_IMPORTS_MONTHS,
+        }, timeout=20)
+        resp.raise_for_status()
+        data = resp.json().get("response", {}).get("data", [])
+        if not data:
+            return pd.Series(dtype=float)
+        dates  = [r["period"] for r in data]
+        values = [float(r["quantity"]) if r.get("quantity") not in (None, "") else float("nan")
+                  for r in data]
+        return pd.Series(values, index=pd.to_datetime(dates)).sort_index().dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# CFTC COT Report — WTI Crude Oil
+# ---------------------------------------------------------------------------
+
+def _cot_url(year: int) -> str:
+    return config.COT_REPORT_URL_TEMPLATE.format(year=year)
+
+
+def _download_cot_year(year: int) -> pd.DataFrame | None:
+    url = _cot_url(year)
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            fname = z.namelist()[0]
+            with z.open(fname) as f:
+                df = pd.read_csv(f, low_memory=False)
+        return df
+    except Exception:
+        return None
+
+
+def fetch_cot_oil(years: int = config.COT_HISTORICAL_YEARS) -> pd.DataFrame:
+    """
+    Download CFTC disaggregated COT report for WTI crude oil (NYMEX).
+    Returns weekly DataFrame with: date, noncomm_long, noncomm_short, noncomm_net, comm_net, open_interest
+    """
+    current_year = datetime.today().year
+    frames = []
+
+    for y in range(current_year - years + 1, current_year + 1):
+        df = _download_cot_year(y)
+        if df is None:
+            continue
+        oil = df[df["CFTC_Contract_Market_Code"].astype(str).str.strip() == config.COT_OIL_CODE].copy()
+        if oil.empty:
+            for col in df.columns:
+                if "contract" in col.lower() and "code" in col.lower():
+                    oil = df[df[col].astype(str).str.strip() == config.COT_OIL_CODE].copy()
+                    break
+        if oil.empty:
+            continue
+        frames.append(oil)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    date_col = None
+    for c in ["Report_Date_as_YYYY-MM-DD", "As_of_Date_In_Form_YYMMDD", "Report_Date_as_MM_DD_YYYY"]:
+        if c in combined.columns:
+            date_col = c
+            break
+    if date_col is None:
+        return pd.DataFrame()
+
+    combined["date"] = pd.to_datetime(combined[date_col], errors="coerce")
+    combined = combined.dropna(subset=["date"]).sort_values("date")
+
+    col_map = {
+        "M_Money_Positions_Long_All":   "noncomm_long",
+        "M_Money_Positions_Short_All":  "noncomm_short",
+        "Prod_Merc_Positions_Long_All": "comm_long",
+        "Prod_Merc_Positions_Short_All":"comm_short",
+        "Open_Interest_All":            "open_interest",
+    }
+
+    out = combined[["date"] + [c for c in col_map if c in combined.columns]].copy()
+    out = out.rename(columns=col_map)
+    out = out.drop_duplicates(subset=["date"]).set_index("date")
+
+    if "noncomm_long" in out.columns and "noncomm_short" in out.columns:
+        out["noncomm_net"] = out["noncomm_long"] - out["noncomm_short"]
+    if "comm_long" in out.columns and "comm_short" in out.columns:
+        out["comm_net"] = out["comm_long"] - out["comm_short"]
+
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ICT-specific fetchers (daily, weekly, monthly OHLCV for WTI)
+# ---------------------------------------------------------------------------
+
+def _flatten_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex columns from yfinance single-ticker downloads."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in raw.columns]
+    df = raw[needed].dropna(subset=["Close"])
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df
+
+
+def fetch_weekly_oil_ohlcv(years: int = config.PRICE_HISTORY_YEARS) -> pd.DataFrame:
+    """Full OHLCV for CL=F at weekly resolution (for ICT analysis)."""
+    start = _years_ago(years)
+    try:
+        raw = yf.download("CL=F", start=start, interval="1wk",
+                          auto_adjust=True, progress=False)
+        return _flatten_ohlcv(raw)
+    except Exception:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+
+def fetch_monthly_prices(years: int = config.ICT_MONTHLY_YEARS) -> pd.DataFrame:
+    """Monthly OHLCV for CL=F over the last `years` years (for ICT structure)."""
+    start = _years_ago(years)
+    try:
+        raw = yf.download("CL=F", start=start, interval="1mo",
+                          auto_adjust=True, progress=False)
+        return _flatten_ohlcv(raw)
+    except Exception:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+
+def fetch_daily_prices(days: int = config.ICT_DAILY_DAYS) -> pd.DataFrame:
+    """Daily OHLCV for CL=F over the last `days` calendar days (for ICT entry charts)."""
+    start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        raw = yf.download("CL=F", start=start, interval="1d",
+                          auto_adjust=True, progress=False)
+        return _flatten_ohlcv(raw)
+    except Exception:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+
+# ---------------------------------------------------------------------------
+# Aggregate fetch — single call that returns everything
+# ---------------------------------------------------------------------------
+
+def fetch_all_data(fred_key: str = "", eia_key: str = "") -> dict:
+    """
+    Master fetcher. Returns dict with all data needed by indicators and scoring.
+    """
+    prices      = fetch_weekly_prices()
+    etf_shares  = fetch_etf_shares_outstanding()
+    fred        = fetch_fred_series(api_key=fred_key)
+    eia         = fetch_eia_inventory(api_key=eia_key)
+    imports     = fetch_eia_imports(api_key=eia_key)
+    cot         = fetch_cot_oil()
+    weekly_oil  = fetch_weekly_oil_ohlcv()
+    monthly_oil = fetch_monthly_prices()
+    daily_oil   = fetch_daily_prices()
+
+    return {
+        "prices":       prices,
+        "etf_shares":   etf_shares,
+        "fred":         fred,
+        "eia":          eia,
+        "imports":      imports,
+        "cot":          cot,
+        "weekly_oil":   weekly_oil,
+        "monthly_oil":  monthly_oil,
+        "daily_oil":    daily_oil,
+        "fetched_at":   datetime.now(),
+    }
